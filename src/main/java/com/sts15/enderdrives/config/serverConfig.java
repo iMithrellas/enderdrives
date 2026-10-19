@@ -73,6 +73,9 @@ public class serverConfig {
     public static ModConfigSpec.IntValue END_DB_MIN_DB_COMMIT_INTERVAL_MS;
     public static ModConfigSpec.IntValue END_DB_MAX_DB_COMMIT_INTERVAL_MS;
     public static ModConfigSpec.BooleanValue END_DB_DEBUG_LOG;
+    public static ModConfigSpec.BooleanValue END_DB_ASYNC_ITEM_WAL;
+    public static ModConfigSpec.IntValue END_DB_ITEM_WAL_SYNC_INTERVAL_MS;
+    public static ModConfigSpec.IntValue END_DB_ITEM_WAL_QUEUE_MIB;
 
     // === Tape Disk Configs ===
     public static final String CATEGORY_TAPEDISK = "tape_disk";
@@ -219,6 +222,20 @@ public class serverConfig {
 
     private static void enderDBConfig() {
         SERVER_BUILDER.comment(CATEGORY_DESC_ENDERDB).push(CATEGORY_ENDERDB);
+        END_DB_ASYNC_ITEM_WAL = SERVER_BUILDER
+                .comment("Use a dedicated queued writer for the ITEM database WAL (requires server restart).",
+                        "Improves automation throughput. A crash can roll back recent accepted transfers,",
+                        "potentially losing or duplicating items relative to other saved inventories.")
+                .define("async_item_wal", false);
+        END_DB_ITEM_WAL_SYNC_INTERVAL_MS = SERVER_BUILDER
+                .comment("Target sync interval (ms) for the queued item WAL. Large batches sync sooner.",
+                        "Storage stalls can extend this interval. Requires server restart.")
+                .defineInRange("item_wal_sync_interval_ms", 250, 1, 60000);
+        END_DB_ITEM_WAL_QUEUE_MIB = SERVER_BUILDER
+                .comment("Memory budget (MiB) for queued and in-flight item WAL transactions, including overhead.",
+                        "When full, new mutations are rejected before changing inventory contents.",
+                        "A single transaction must fit this budget. Requires server restart.")
+                .defineInRange("item_wal_queue_mib", 64, 1, 1024);
         END_DB_MERGE_BUFFER_THRESHOLD = SERVER_BUILDER
                 .comment("Number of pending WAL entries before merging")
                 .defineInRange("merge_buffer_threshold", 100, 1, 10_000);

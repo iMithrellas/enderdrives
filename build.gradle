@@ -110,6 +110,10 @@ repositories {
 
 dependencies {
 
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+
     implementation "org.appliedenergistics:appliedenergistics2:${ae2_version}"
 
     compileOnly "curse.maven:ftb-library-forge-404465:8574542"
@@ -143,6 +147,10 @@ base {
 }
 
 java.toolchain.languageVersion = JavaLanguageVersion.of(25)
+
+tasks.named('test', Test) {
+    useJUnitPlatform()
+}
 
 neoForge {
     version = project.neo_version
@@ -184,6 +192,11 @@ neoForge {
         "${mod_id}" {
             sourceSet(sourceSets.main)
         }
+    }
+
+    unitTest {
+        enable()
+        testedMod = mods[mod_id]
     }
 }
 

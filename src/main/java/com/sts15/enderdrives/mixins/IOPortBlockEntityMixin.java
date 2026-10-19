@@ -16,7 +16,6 @@ import appeng.api.storage.cells.StorageCell;
 import appeng.blockentity.storage.DriveBlockEntity;
 import appeng.blockentity.storage.IOPortBlockEntity;
 import appeng.util.inv.AppEngInternalInventory;
-import com.sts15.enderdrives.db.EnderDBManager;
 import com.sts15.enderdrives.db.EnderFluidDBManager;
 import com.sts15.enderdrives.inventory.EnderDiskInventory;
 import com.sts15.enderdrives.inventory.EnderFluidDiskInventory;
@@ -59,9 +58,8 @@ public abstract class IOPortBlockEntityMixin {
             return;
         }
 
-        // 2) Ender disk sync
+        // 2) Item contents are already visible in RAM, including queued WAL mutations.
         if (sourceInv instanceof EnderDiskInventory ed) {
-            EnderDBManager.flushWALQueue();
             long rem = enderdrives$transferOneTypeSynced(grid, ed, toMove, mode);
             if (rem < toMove) {
                 cir.setReturnValue(rem);

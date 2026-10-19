@@ -24,6 +24,7 @@
   "commands.enderdrives.setfreq.success": "Set the held disk frequency to %s.",
   "commands.enderdrives.stats.fluids": "Fluid database: %1$s records, %2$s writes, %3$s commits, %4$s bytes on disk.",
   "commands.enderdrives.stats.items": "Item database: %1$s records, %2$s writes, %3$s commits, %4$s bytes on disk.",
+  "commands.enderdrives.stats.item_wal": "Queued item WAL (current generation): %1$s accepted, %2$s durable, %3$s pending bytes, %4$s peak bytes, %5$s rejected, %6$s syncs.",
   "commands.enderdrives.stress.complete": "Stress test complete.",
   "commands.enderdrives.stress.duplicate": "Serialized-data hash collision at item %s.",
   "commands.enderdrives.stress.duplicates": "Hash collisions: %s.",

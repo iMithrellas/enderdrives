@@ -27,6 +27,16 @@ public final class StatsCommand {
                             EnderDBManager.getDatabaseFileSizeBytes()
                     ), false);
 
+                    var walStats = EnderDBManager.getQueuedWalStats();
+                    if (walStats != null) {
+                        source.sendSuccess(() -> Component.translatable(
+                                "commands.enderdrives.stats.item_wal",
+                                walStats.acceptedTransactions(), walStats.durableTransactions(),
+                                walStats.pendingBytes(), walStats.highWaterBytes(),
+                                walStats.rejectedTransactions(), walStats.forceCount()
+                        ), false);
+                    }
+
                     source.sendSuccess(() -> Component.translatable(
                             "commands.enderdrives.stats.fluids",
                             EnderFluidDBManager.getDatabaseSize(),

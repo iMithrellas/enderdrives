@@ -55,6 +55,11 @@ public final class EnderDBManager {
     private static File dbFile;
     private static File currentWAL;
     private static FileOutputStream walFileStream;
+    private static volatile QueuedWalWriter queuedWalWriter;
+    private static boolean asyncItemWal;
+    private static long walSyncIntervalMs;
+    private static long walQueueBytes;
+    private static final Object backgroundSignal = new Object();
     private static Thread commitThread;
     private static volatile boolean initialized;
     private static volatile Lifecycle lifecycle = Lifecycle.STOPPED;
@@ -94,6 +99,9 @@ public final class EnderDBManager {
                 currentWAL = worldDir.resolve(WAL_FILE_NAME).toFile();
                 minDbCommitMs = Math.max(100L, serverConfig.END_DB_MIN_DB_COMMIT_INTERVAL_MS.get());
                 debugLog = serverConfig.END_DB_DEBUG_LOG.get();
+                asyncItemWal = serverConfig.END_DB_ASYNC_ITEM_WAL.get();
+                walSyncIntervalMs = serverConfig.END_DB_ITEM_WAL_SYNC_INTERVAL_MS.get();
+                walQueueBytes = serverConfig.END_DB_ITEM_WAL_QUEUE_MIB.get() * 1024L * 1024L;
 
                 loadDatabase();
                 replayWALs();
@@ -134,7 +142,7 @@ public final class EnderDBManager {
         stopBackgroundThread();
 
         synchronized (commitLock) {
-            boolean committed = dbFile != null && currentWAL != null && walFileStream != null
+            boolean committed = dbFile != null && currentWAL != null && hasWalWriterLocked()
                     && commitDatabaseLocked();
             closeWalQuietly();
             initialized = false;
@@ -153,7 +161,9 @@ public final class EnderDBManager {
     }
 
     public static boolean isReady() {
-        return initialized && running && lifecycle == Lifecycle.RUNNING;
+        QueuedWalWriter writer = queuedWalWriter;
+        return initialized && running && lifecycle == Lifecycle.RUNNING
+                && (writer == null || writer.failure() == null);
     }
 
     /** Clears derived caches without discarding the live database image. */
@@ -317,6 +327,16 @@ public final class EnderDBManager {
             }
 
             if (!appendWalRecordsLocked(walRecords)) return false;
+            // Scope changes are rare, explicit durability boundaries even in queued mode.
+            if (queuedWalWriter != null) {
+                try {
+                    forceCurrentWalLocked();
+                } catch (IOException e) {
+                    failLifecycleLocked("Could not make the item scope migration durable");
+                    LOGGER.error("Item scope migration WAL barrier failed", e);
+                    return false;
+                }
+            }
             for (ScopeMigration migration : migrations) {
                 StoredEntry source = dbMap.remove(migration.source());
                 StoredEntry destination = dbMap.get(migration.destination());
@@ -434,7 +454,8 @@ public final class EnderDBManager {
     }
 
     private static boolean commitDatabaseLocked() {
-        if (dbFile == null || currentWAL == null || walFileStream == null) return false;
+        if (dbFile == null || currentWAL == null || !hasWalWriterLocked()) return false;
+        if (queuedWalWriter != null && queuedWalWriter.failure() != null) return false;
 
         try {
             forceCurrentWalLocked();
@@ -460,6 +481,9 @@ public final class EnderDBManager {
             log("[commitDatabase] Item database checkpointed successfully");
             return true;
         } catch (IOException e) {
+            if (queuedWalWriter != null && queuedWalWriter.failure() != null) {
+                failLifecycleLocked("Item WAL writer failed; checkpoint and truncation aborted");
+            }
             LOGGER.error("Failed to checkpoint the item database", e);
             return false;
         }
@@ -517,6 +541,10 @@ public final class EnderDBManager {
     public static AtomicLong getTotalItemsWritten() { return totalItemsWritten; }
     public static AtomicLong getTotalCommits() { return totalCommits; }
     public static int getDatabaseSize() { return dbMap.size(); }
+    public static QueuedWalWriter.Stats getQueuedWalStats() {
+        QueuedWalWriter writer = queuedWalWriter;
+        return writer == null ? null : writer.stats();
+    }
     public static long getDatabaseFileSizeBytes() {
         return dbFile != null && dbFile.exists() ? dbFile.length() : 0L;
     }
@@ -534,7 +562,9 @@ public final class EnderDBManager {
                         if (commitDatabase()) totalCommits.incrementAndGet();
                         nextCheckpoint = now + minDbCommitMs;
                     }
-                    Thread.sleep(100);
+                    synchronized (backgroundSignal) {
+                        if (running) backgroundSignal.wait(100);
+                    }
                 } catch (InterruptedException ignored) {
                     Thread.currentThread().interrupt();
                     break;
@@ -554,20 +584,34 @@ public final class EnderDBManager {
             commitThread = null;
             return;
         }
-        thread.interrupt();
-        try {
-            thread.join(2_000);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        synchronized (backgroundSignal) {
+            backgroundSignal.notifyAll();
         }
-        if (thread.isAlive()) LOGGER.warn("Item database checkpoint thread did not stop within two seconds");
+        // Interrupting a checkpoint can close its FileChannel. Wait for ownership to be released
+        // before shutdown/reinitialization can replace or truncate any of its files.
+        boolean interrupted = false;
+        while (thread.isAlive()) {
+            try {
+                thread.join();
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt();
         commitThread = null;
     }
 
     // ==== Mutation and WAL Transactions ====
 
     private static boolean canMutateLocked() {
-        return lifecycle == Lifecycle.RUNNING && initialized && running && walFileStream != null;
+        if (queuedWalWriter != null && queuedWalWriter.failure() != null) {
+            failLifecycleLocked("Item WAL writer failed; storage mutations are disabled");
+        }
+        return lifecycle == Lifecycle.RUNNING && initialized && running && hasWalWriterLocked();
+    }
+
+    private static boolean hasWalWriterLocked() {
+        return walFileStream != null || queuedWalWriter != null;
     }
 
     private static List<byte[]> createRewriteRecords(
@@ -594,7 +638,7 @@ public final class EnderDBManager {
 
     private static boolean appendWalRecordsLocked(List<byte[]> records) {
         if (records.isEmpty()) return true;
-        if (walFileStream == null) return false;
+        if (!hasWalWriterLocked()) return false;
 
         byte[] transaction;
         try {
@@ -602,6 +646,18 @@ public final class EnderDBManager {
         } catch (IOException e) {
             LOGGER.error("Could not serialize the item WAL transaction", e);
             return false;
+        }
+
+        if (queuedWalWriter != null) {
+            try {
+                if (!queuedWalWriter.append(transaction)) return false;
+                totalItemsWritten.addAndGet(records.size());
+                return true;
+            } catch (IOException e) {
+                failLifecycleLocked("Item WAL writer failed; rejecting the mutation");
+                LOGGER.error("Could not enqueue the item WAL transaction", e);
+                return false;
+            }
         }
 
         long startOffset;
@@ -654,12 +710,17 @@ public final class EnderDBManager {
             try {
                 forceCurrentWalLocked();
             } catch (IOException e) {
+                if (queuedWalWriter != null) failLifecycleLocked("Item WAL durability barrier failed");
                 LOGGER.error("Could not force the item WAL", e);
             }
         }
     }
 
     private static void forceCurrentWalLocked() throws IOException {
+        if (queuedWalWriter != null) {
+            queuedWalWriter.flush();
+            return;
+        }
         if (walFileStream == null) throw new IOException("Item WAL stream is not open");
         walFileStream.flush();
         walFileStream.getChannel().force(false);
@@ -847,7 +908,13 @@ public final class EnderDBManager {
     }
 
     private static boolean truncateCurrentWALLocked() {
-        closeWalQuietly();
+        try {
+            closeWal();
+        } catch (IOException e) {
+            failLifecycleLocked("Could not close the item WAL before truncation");
+            LOGGER.error("Item WAL was preserved after a close failure", e);
+            return false;
+        }
         try (RandomAccessFile file = new RandomAccessFile(currentWAL, "rw")) {
             file.setLength(0L);
             file.getFD().sync();
@@ -1151,17 +1218,36 @@ public final class EnderDBManager {
 
     private static void openWALStream() throws IOException {
         if (currentWAL == null) throw new IOException("Item WAL path is not configured");
-        walFileStream = new FileOutputStream(currentWAL, true);
+        if (asyncItemWal) {
+            queuedWalWriter = QueuedWalWriter.open(currentWAL.toPath(), walSyncIntervalMs, walQueueBytes,
+                    error -> LOGGER.error("Item WAL writer failed; storage mutations are disabled", error));
+        } else {
+            walFileStream = new FileOutputStream(currentWAL, true);
+        }
     }
 
     private static void closeWalQuietly() {
-        if (walFileStream == null) return;
         try {
-            walFileStream.close();
+            closeWal();
         } catch (IOException e) {
             LOGGER.warn("Could not close the item WAL stream", e);
-        } finally {
-            walFileStream = null;
+        }
+    }
+
+    private static void closeWal() throws IOException {
+        if (queuedWalWriter != null) {
+            try {
+                queuedWalWriter.close();
+            } finally {
+                queuedWalWriter = null;
+            }
+        }
+        if (walFileStream != null) {
+            try {
+                walFileStream.close();
+            } finally {
+                walFileStream = null;
+            }
         }
     }
 
