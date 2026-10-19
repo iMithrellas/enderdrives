@@ -152,6 +152,31 @@ tasks.named('test', Test) {
     useJUnitPlatform()
 }
 
+// Exercise the production WAL writer without starting Minecraft or touching a world's database.
+sourceSets {
+    walBenchmark {
+        java {
+            srcDirs = ['src/benchmark/java', 'src/main/java']
+            include '**/WalBenchmark.java', '**/QueuedWalWriter.java'
+        }
+    }
+}
+
+tasks.register('walBenchmark', JavaExec) {
+    group = 'verification'
+    description = 'Compare synchronous and queued item WAL writes with tick-sized bursts.'
+    classpath = sourceSets.walBenchmark.runtimeClasspath
+    mainClass = 'com.sts15.enderdrives.db.WalBenchmark'
+    args providers.gradleProperty('walBenchmarkDir').getOrElse(layout.buildDirectory.dir('wal-benchmark').get().asFile.path),
+            providers.gradleProperty('walMutations').getOrElse('500'),
+            providers.gradleProperty('walTicks').getOrElse('100'),
+            providers.gradleProperty('walKeyBytes').getOrElse('128'),
+            providers.gradleProperty('walSyncMs').getOrElse('250'),
+            providers.gradleProperty('walRounds').getOrElse('3'),
+            providers.gradleProperty('walPaced').getOrElse('true'),
+            providers.gradleProperty('walQueueMiB').getOrElse('64')
+}
+
 neoForge {
     version = project.neo_version
 
